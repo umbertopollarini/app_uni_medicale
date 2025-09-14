@@ -9,6 +9,10 @@ import 'package:crypto/crypto.dart' as crypto;
 import 'crypto/encryption_service.dart';
 import 'dart:typed_data';
 
+import 'package:http/http.dart' as http;
+import 'package:cryptography/cryptography.dart';
+import 'crypto/key_manager.dart';
+
 //
 
 import 'payload/health_payload.dart';
@@ -41,6 +45,27 @@ class HealthBlockchainApp extends StatelessWidget {
   }
 }
 
+class UploadedRecord {
+  final String recordId;
+  final String cid;
+  final DateTime createdAt;
+
+  UploadedRecord(
+      {required this.recordId, required this.cid, required this.createdAt});
+
+  Map<String, dynamic> toJson() => {
+        'recordId': recordId,
+        'cid': cid,
+        'createdAt': createdAt.toIso8601String(),
+      };
+
+  static UploadedRecord fromJson(Map<String, dynamic> m) => UploadedRecord(
+        recordId: m['recordId'] as String,
+        cid: m['cid'] as String,
+        createdAt: DateTime.parse(m['createdAt'] as String),
+      );
+}
+
 class HealthHomePage extends StatefulWidget {
   const HealthHomePage({super.key});
 
@@ -57,6 +82,13 @@ class _HealthHomePageState extends State<HealthHomePage>
   late AnimationController _animationController;
   late Animation<double> _scaleAnimation;
   Map<String, dynamic>? _manifestBase; // ← manifest per i wrap chiave (owner)
+
+  static const String kBackendBaseUrl = 'http://193.70.113.55:8787';
+  // Map<String, dynamic>? _manifestBase;
+  List<UploadedRecord> _uploadedRecords = [];
+
+  bool _uploadingIpfs = false;
+  bool _uploadedOk = false;
 
   Uint8List? _encryptedBytes; // risultato cifratura da inviare a IPFS
   String? _ipfsCid;
@@ -92,6 +124,7 @@ class _HealthHomePageState extends State<HealthHomePage>
     _animationController.forward();
     _initializeHealthData();
     _loadLastSync();
+    _loadUploadedRecords();
   }
 
   @override
@@ -163,6 +196,7 @@ class _HealthHomePageState extends State<HealthHomePage>
         _encryptedBytes = enc.encryptedBytes;
         _manifestBase =
             manifestBase; // ⬅️ salva manifest base per l’upload successivo
+        _uploadedOk = false; // ⬅️ reset
       });
 
       if (!mounted) return;
@@ -210,11 +244,13 @@ class _HealthHomePageState extends State<HealthHomePage>
   Future<void> _uploadToIpfs() async {
     if (_encryptedBytes == null || _payloadBytes == null) return;
 
+    setState(() {
+      _uploadingIpfs = true;
+      _uploadedOk = false; // ⬅️ reset
+    });
+
     final recordId = _sha256Hex(_payloadBytes!);
-    final client = IpfsClient(
-      baseUrl:
-          'http://193.70.113.55:8787', // <-- usa il tuo server, non localhost
-    );
+    final client = IpfsClient(baseUrl: kBackendBaseUrl);
     try {
       final res = await client.uploadEncryptedBytes(
         encryptedBytes: _encryptedBytes!,
@@ -224,7 +260,10 @@ class _HealthHomePageState extends State<HealthHomePage>
 
       if (!mounted) return;
       if (res.ok && res.cid != null) {
-        setState(() => _ipfsCid = res.cid);
+        setState(() {
+          _ipfsCid = res.cid;
+          _uploadedOk = true; // ⬅️ segnala successo
+        });
 
         // ⬇️ INVIA anche il MANIFEST al backend (se presente)
         if (_manifestBase != null) {
@@ -245,6 +284,8 @@ class _HealthHomePageState extends State<HealthHomePage>
             debugPrint('✅ Manifest salvato');
           }
         }
+
+        await _rememberUploadedRecord(recordId, res.cid!);
 
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
@@ -279,6 +320,8 @@ class _HealthHomePageState extends State<HealthHomePage>
             content: Text('Errore upload: $e'),
             behavior: SnackBarBehavior.floating),
       );
+    } finally {
+      if (mounted) setState(() => _uploadingIpfs = false); // ⬅️ STOP loading
     }
   }
 
@@ -415,7 +458,7 @@ class _HealthHomePageState extends State<HealthHomePage>
     if (!_dataLoaded) return const SizedBox.shrink();
 
     return Container(
-      margin: const EdgeInsets.all(20),
+      margin: const EdgeInsets.fromLTRB(20, 0, 20, 14),
       padding: const EdgeInsets.all(20),
       decoration: BoxDecoration(
         color: Colors.white,
@@ -517,6 +560,44 @@ class _HealthHomePageState extends State<HealthHomePage>
     return displayNames[type] ?? type;
   }
 
+  Future<void> _loadUploadedRecords() async {
+    final prefs = await SharedPreferences.getInstance();
+    final s = prefs.getString('uploaded_records');
+    if (s == null) return;
+    final List list = jsonDecode(s) as List;
+    setState(() {
+      _uploadedRecords = list
+          .map((e) => UploadedRecord.fromJson(e as Map<String, dynamic>))
+          .toList();
+    });
+  }
+
+  Future<void> _rememberUploadedRecord(String recordId, String cid) async {
+    final rec =
+        UploadedRecord(recordId: recordId, cid: cid, createdAt: DateTime.now());
+    setState(() {
+      // evita duplicati per lo stesso recordId
+      _uploadedRecords.removeWhere((r) => r.recordId == recordId);
+      _uploadedRecords.insert(0, rec);
+    });
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(
+      'uploaded_records',
+      jsonEncode(_uploadedRecords.map((r) => r.toJson()).toList()),
+    );
+  }
+
+  void _openRecordsPage() {
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => RecordsPage(
+          backendBaseUrl: kBackendBaseUrl,
+          records: _uploadedRecords,
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -582,6 +663,29 @@ class _HealthHomePageState extends State<HealthHomePage>
                           textAlign: TextAlign.center,
                         ),
                       ),
+                    const SizedBox(height: 16),
+
+                    // 🔹 Pulsante per vedere i record caricati (nuova sezione)
+                    SizedBox(
+                      width: double.infinity,
+                      height: 48,
+                      child: OutlinedButton.icon(
+                        onPressed:
+                            _uploadedRecords.isEmpty ? null : _openRecordsPage,
+                        icon: const Icon(Icons.lock_outline),
+                        label: Text(
+                          _uploadedRecords.isEmpty
+                              ? "Nessun record caricato"
+                              : "I miei record su IPFS (${_uploadedRecords.length})",
+                        ),
+                        style: OutlinedButton.styleFrom(
+                          side: BorderSide(color: Colors.blue[400]!),
+                          shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(14)),
+                          foregroundColor: Colors.blue[700],
+                        ),
+                      ),
+                    ),
                   ],
                 ),
               ),
@@ -650,6 +754,10 @@ class _HealthHomePageState extends State<HealthHomePage>
                                         setState(() {
                                           _statusMessage =
                                               "Caricamento dati sanitari...";
+                                          // Hard reset stato upload
+                                          _encryptedBytes = null;
+                                          _ipfsCid = null;
+                                          _manifestBase = null;
                                         });
                                         await _loadHealthData();
                                       },
@@ -658,8 +766,7 @@ class _HealthHomePageState extends State<HealthHomePage>
                                   foregroundColor: Colors.white,
                                   elevation: 0,
                                   shape: RoundedRectangleBorder(
-                                    borderRadius: BorderRadius.circular(16),
-                                  ),
+                                      borderRadius: BorderRadius.circular(16)),
                                   disabledBackgroundColor: Colors.grey[300],
                                 ),
                                 child: _isLoading
@@ -674,9 +781,8 @@ class _HealthHomePageState extends State<HealthHomePage>
                                     : const Text(
                                         "Carica Dati Sanitari",
                                         style: TextStyle(
-                                          fontSize: 18,
-                                          fontWeight: FontWeight.w600,
-                                        ),
+                                            fontSize: 18,
+                                            fontWeight: FontWeight.w600),
                                       ),
                               ),
                             ),
@@ -692,9 +798,8 @@ class _HealthHomePageState extends State<HealthHomePage>
                 switchOutCurve: Curves.easeIn,
                 transitionBuilder: (child, anim) => SlideTransition(
                   position: Tween<Offset>(
-                    begin: const Offset(0, 0.08),
-                    end: Offset.zero,
-                  ).animate(anim),
+                          begin: const Offset(0, 0.08), end: Offset.zero)
+                      .animate(anim),
                   child: FadeTransition(opacity: anim, child: child),
                 ),
                 child: _dataLoaded
@@ -706,7 +811,8 @@ class _HealthHomePageState extends State<HealthHomePage>
               ),
 
               // Bottone "Cifra payload" (visibile solo dopo il caricamento)
-              if (_dataLoaded)
+              if (_dataLoaded &&
+                  (_encryptedBytes == null || _manifestBase == null))
                 Padding(
                   padding: const EdgeInsets.fromLTRB(20, 8, 20, 24),
                   child: SizedBox(
@@ -721,50 +827,363 @@ class _HealthHomePageState extends State<HealthHomePage>
                         foregroundColor: Colors.white,
                         elevation: 0,
                         shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(16),
-                        ),
+                            borderRadius: BorderRadius.circular(16)),
                         disabledBackgroundColor: Colors.grey[300],
                       ),
                       child: const Text(
                         "Cifra payload",
                         style: TextStyle(
-                          fontSize: 18,
-                          fontWeight: FontWeight.w600,
-                        ),
+                            fontSize: 18, fontWeight: FontWeight.w600),
                       ),
                     ),
                   ),
                 ),
-              Padding(
-                padding: const EdgeInsets.fromLTRB(20, 0, 20, 24),
-                child: SizedBox(
-                  width: double.infinity,
-                  height: 56,
-                  child: ElevatedButton.icon(
-                    onPressed:
-                        (_encryptedBytes != null && _manifestBase != null)
-                            ? _uploadToIpfs
-                            : null,
-                    icon: const Icon(Icons.cloud_upload_outlined),
-                    label: const Text("Carica su IPFS",
-                        style: TextStyle(
-                            fontSize: 18, fontWeight: FontWeight.w600)),
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: Colors.green[600],
-                      foregroundColor: Colors.white,
-                      elevation: 0,
-                      shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(16)),
-                      disabledBackgroundColor: Colors.grey[300],
-                    ),
-                  ),
-                ),
-              ),
-              const SizedBox(height: 40),
+
+              // Bottone upload IPFS
+              (_encryptedBytes != null && _manifestBase != null)
+                  ? Padding(
+                      padding: const EdgeInsets.fromLTRB(20, 8, 20, 24),
+                      child: SizedBox(
+                        width: double.infinity,
+                        height: 56,
+                        child: ElevatedButton.icon(
+                          onPressed: (_encryptedBytes != null &&
+                                  _manifestBase != null &&
+                                  !_uploadingIpfs &&
+                                  !_uploadedOk)
+                              ? _uploadToIpfs
+                              : null,
+                          icon: _uploadingIpfs
+                              ? const SizedBox(
+                                  width: 20,
+                                  height: 20,
+                                  child: CircularProgressIndicator(
+                                    color: Colors.white,
+                                    strokeWidth: 2.2,
+                                  ),
+                                )
+                              : const Icon(Icons.cloud_upload_outlined),
+                          label: Text(
+                            _uploadingIpfs
+                                ? "Caricamento..."
+                                : (_uploadedOk
+                                    ? "Caricato correttamente"
+                                    : "Carica su IPFS"),
+                            style: const TextStyle(
+                                fontSize: 18, fontWeight: FontWeight.w600),
+                          ),
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: Colors.green[600],
+                            foregroundColor: Colors.white,
+                            elevation: 0,
+                            shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(16)),
+                            disabledBackgroundColor: Colors.grey[300],
+                          ),
+                        ),
+                      ),
+                    )
+                  : Container(),
+
+              // Richiamo “I miei record” anche in basso (comodo)
+              // Padding(
+              //   padding: const EdgeInsets.fromLTRB(20, 0, 20, 32),
+              //   child: SizedBox(
+              //     width: double.infinity,
+              //     height: 48,
+              //     child: OutlinedButton.icon(
+              //       onPressed:
+              //           _uploadedRecords.isEmpty ? null : _openRecordsPage,
+              //       icon: const Icon(Icons.folder_open),
+              //       label: Text(
+              //         _uploadedRecords.isEmpty
+              //             ? "I miei record (vuoto)"
+              //             : "I miei record (${_uploadedRecords.length})",
+              //       ),
+              //       style: OutlinedButton.styleFrom(
+              //         side: BorderSide(color: Colors.blue[200]!),
+              //         shape: RoundedRectangleBorder(
+              //             borderRadius: BorderRadius.circular(14)),
+              //         foregroundColor: Colors.blue[700],
+              //       ),
+              //     ),
+              //   ),
+              // ),
             ],
           ),
         ),
       ),
+    );
+  }
+}
+
+class RecordsPage extends StatefulWidget {
+  final String backendBaseUrl;
+  final List<UploadedRecord> records;
+
+  const RecordsPage({
+    super.key,
+    required this.backendBaseUrl,
+    required this.records,
+  });
+
+  @override
+  State<RecordsPage> createState() => _RecordsPageState();
+}
+
+class _RecordsPageState extends State<RecordsPage> {
+  bool _busy = false;
+
+  // Aggiungi in RecordsPage:
+  Future<void> _showPlainJson(BuildContext context, String jsonStr) async {
+    await showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(18)),
+      ),
+      builder: (_) {
+        return SafeArea(
+          child: Padding(
+            padding: EdgeInsets.only(
+              left: 16,
+              right: 16,
+              top: 12,
+              bottom: 16 + MediaQuery.of(context).viewInsets.bottom,
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(
+                    width: 40,
+                    height: 4,
+                    margin: const EdgeInsets.only(bottom: 12),
+                    decoration: BoxDecoration(
+                        color: Colors.black26,
+                        borderRadius: BorderRadius.circular(2))),
+                const Text('Payload in chiaro',
+                    style:
+                        TextStyle(fontSize: 18, fontWeight: FontWeight.w600)),
+                const SizedBox(height: 12),
+                Container(
+                  constraints: const BoxConstraints(maxHeight: 400),
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFFAFAFA),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: Colors.black12),
+                  ),
+                  child: SingleChildScrollView(
+                    child: Text(
+                      const JsonEncoder.withIndent('  ')
+                          .convert(json.decode(jsonStr)),
+                      style: const TextStyle(
+                          fontFamily: 'monospace', fontSize: 13.5),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                Row(
+                  children: [
+                    Expanded(
+                      child: OutlinedButton.icon(
+                        icon: const Icon(Icons.copy),
+                        label: const Text('Copia'),
+                        onPressed: () {
+                          Clipboard.setData(ClipboardData(text: jsonStr));
+                          ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(content: Text('Copiato')));
+                        },
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: ElevatedButton.icon(
+                        icon: const Icon(Icons.ios_share),
+                        label: const Text('Condividi'),
+                        onPressed: () {
+                          // opzionale: integrazione con share_plus
+                        },
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Future<void> _viewClear(UploadedRecord rec) async {
+    if (_busy) return;
+    setState(() => _busy = true);
+    try {
+      final recordId = rec.recordId;
+
+      // 1) Manifest dal backend
+      final manifestRes = await http
+          .get(Uri.parse('${widget.backendBaseUrl}/keywraps/$recordId'));
+      if (manifestRes.statusCode != 200) {
+        throw Exception('Manifest non trovato (${manifestRes.statusCode})');
+      }
+      final manifest = jsonDecode(manifestRes.body) as Map<String, dynamic>;
+      final m = manifest['manifest'] as Map<String, dynamic>? ?? {};
+      final owner =
+          (m['wraps'] as Map<String, dynamic>)['owner'] as Map<String, dynamic>;
+      final cid = (manifest['cid'] ?? m['cid'] ?? rec.cid) as String;
+
+      // 2) Deriva KEK_device
+      final kek = await KeyManager.deriveKekDevice();
+
+      // 3) Unwrap DEK (AES-GCM, aad=recordId)
+      final aead = AesGcm.with256bits();
+      final wrapNonce = base64Decode(owner['nonce'] as String);
+      final wrapMac = base64Decode(owner['mac'] as String);
+      final wrapCipher = base64Decode(owner['dek'] as String);
+      final dekBytes = await aead.decrypt(
+        SecretBox(wrapCipher, nonce: wrapNonce, mac: Mac(wrapMac)),
+        secretKey: kek,
+        aad: utf8.encode(recordId),
+      );
+      final dek = SecretKey(dekBytes);
+
+// 4) Scarica blob IPFS (nonce|cipher|mac)
+// Usa URL *senza* path; opzionale: fallback su altri gateway
+      final candidates = <String>[
+        'https://w3s.link/ipfs/$cid', // preferito per Web3.Storage
+        'https://$cid.ipfs.w3s.link', // subdomain gateway
+        'https://ipfs.io/ipfs/$cid', // fallback
+        'https://cloudflare-ipfs.com/ipfs/$cid',
+        'https://dweb.link/ipfs/$cid',
+      ];
+
+      http.Response? blobRes;
+      for (final u in candidates) {
+        try {
+          final r =
+              await http.get(Uri.parse(u)).timeout(const Duration(seconds: 12));
+          if (r.statusCode == 200 && r.bodyBytes.isNotEmpty) {
+            blobRes = r;
+            break;
+          }
+        } catch (_) {
+          // ignora timeout/errore e prova il prossimo gateway
+        }
+      }
+
+      if (blobRes == null) {
+        throw Exception('Download IPFS fallito (tutti i gateway)');
+      }
+
+      final bytes = blobRes.bodyBytes;
+      if (bytes.length < 12 + 16) {
+        throw Exception('Blob troppo corto');
+      }
+
+      final dataNonce = bytes.sublist(0, 12);
+      final dataMac = bytes.sublist(bytes.length - 16);
+      final dataCipher = bytes.sublist(12, bytes.length - 16);
+
+      // 5) Decrypt dati (AAD = recordId)
+      final plain = await aead.decrypt(
+        SecretBox(dataCipher, nonce: dataNonce, mac: Mac(dataMac)),
+        secretKey: dek,
+        aad: utf8.encode(recordId),
+      );
+
+      final jsonStr = utf8.decode(plain);
+      if (!mounted) return;
+      await _showPlainJson(context, jsonStr);
+
+      // Ripulisci subito i segreti dalla RAM
+      plain.fillRange(0, plain.length, 0);
+      dataCipher.fillRange(0, dataCipher.length, 0);
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Errore decrypt: $e')),
+      );
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  String _short(String s, {int head = 8, int tail = 6}) {
+    if (s.length <= head + tail) return s;
+    return '${s.substring(0, head)}…${s.substring(s.length - tail)}';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('I miei record su IPFS'),
+      ),
+      body: widget.records.isEmpty
+          ? const Center(child: Text('Nessun record caricato finora'))
+          : ListView.separated(
+              padding: const EdgeInsets.all(12),
+              itemCount: widget.records.length,
+              separatorBuilder: (_, __) => const SizedBox(height: 12),
+              itemBuilder: (_, i) {
+                final r = widget.records[i];
+                return Container(
+                  padding: const EdgeInsets.all(14),
+                  decoration: BoxDecoration(
+                    color: Colors.white,
+                    borderRadius: BorderRadius.circular(14),
+                    boxShadow: [
+                      BoxShadow(
+                          color: Colors.black.withOpacity(0.06),
+                          blurRadius: 8,
+                          offset: const Offset(0, 3))
+                    ],
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text('RecordId: ${_short(r.recordId)}',
+                          style: const TextStyle(fontWeight: FontWeight.w600)),
+                      const SizedBox(height: 6),
+                      Text('CID: ${_short(r.cid)}',
+                          style: TextStyle(color: Colors.grey[700])),
+                      const SizedBox(height: 6),
+                      Text('Creato: ${r.createdAt.toLocal()}',
+                          style:
+                              TextStyle(color: Colors.grey[600], fontSize: 12)),
+                      const SizedBox(height: 12),
+                      Row(
+                        children: [
+                          ElevatedButton.icon(
+                            onPressed: _busy ? null : () => _viewClear(r),
+                            icon: const Icon(Icons.remove_red_eye_outlined),
+                            label: const Text('Vedi in chiaro'),
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: Colors.blue[700],
+                              foregroundColor: Colors.white,
+                              shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(10)),
+                            ),
+                          ),
+                          const SizedBox(width: 12),
+                          OutlinedButton.icon(
+                            onPressed: () {
+                              Clipboard.setData(ClipboardData(text: r.cid));
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                  const SnackBar(content: Text('CID copiato')));
+                            },
+                            icon: const Icon(Icons.copy),
+                            label: const Text('Copia CID'),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                );
+              },
+            ),
     );
   }
 }
